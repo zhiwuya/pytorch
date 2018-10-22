@@ -2005,7 +2005,7 @@ class TestJit(JitTestCase):
             torch.ones(1))
 
         @torch.jit.script
-        def hints(x, a=0.5, b=10):  # noqa: E999
+        def hints(x, a=0.5, b=10):
             # type: (Tensor, float, int) -> Tensor
             return x + a + b
 
@@ -5205,9 +5205,15 @@ a")
             q = fn(x, x)
             return x
 
+        def fn_string(str, strpair):
+            # type: (str, Tuple[str, str]) -> Tuple[str, int, str, str]
+            str1, str2 = strpair
+            return str, 2, str1, str2
+
         x = torch.ones(2, 2)
         self.checkScript(fn_unpack, (x,), optimize=True)
         self.checkScript(fn_index, (x,), optimize=True)
+        self.checkScript(fn_string, ("1", ("3", "4")), optimize=True)
 
     def test_type_annotations_varargs(self):
         def fn_varargs(x, *args):
@@ -7383,11 +7389,11 @@ a")
                 x = x + 3
             return x + 4 + inner(x)
 
-        @torch.jit.weak_script
+        @torch._jit_internal.weak_script
         def weak_script_fn_inner(x):
             return x + 6 + not_a_script_fn(x)
 
-        @torch.jit.weak_script
+        @torch._jit_internal.weak_script
         def weak_script_fn(x):
             return x + 5 + weak_script_fn_inner(x) + weak_script_fn_inner(x)
 
@@ -8069,8 +8075,6 @@ EXCLUDE_SCRIPT = {
     'test_nn_affine_grid',
 
     # unknown builtin op
-    'test_nn_tanhshrink',
-    'test_nn_softsign',
     'test_nn_softmin',
     'test_nn_local_response_norm',
     'test_nn_poisson_nll_loss',
