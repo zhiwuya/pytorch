@@ -22,33 +22,6 @@ bool shouldAnnotate(const Value* v) {
 
 AliasDb::AliasDb(std::shared_ptr<Graph> graph) : graph_(std::move(graph)) {
   analyze(graph_);
-
-  // Build helper indices
-  // NOTE: that these assume that AliasDb is immutable once constructed.
-  // - Alias set -> value mapping
-  for (const auto& pr : valueToAlias_) {
-    const auto value = pr.first;
-    const auto& aliasInfo = pr.second;
-    // We don't support composite types yet
-    JIT_ASSERT(aliasInfo.containedTypes().size() == 0);
-    for (const auto aliasSet : aliasInfo.sets()) {
-      aliasToValue_[aliasSet].insert(value);
-    }
-  }
-  // - Set of all nodes with a wildcard
-  buildWildcardIndex(graph_->block());
-}
-
-void AliasDb::buildWildcardIndex(const Block* b) {
-  for (const auto node : b->nodes()) {
-    for (const auto block : node->blocks()) {
-      buildWildcardIndex(block);
-    }
-
-    if (hasWildcardImpl(node)) {
-      wildcardNodes_.insert(node);
-    }
-  }
 }
 
 bool AliasDb::hasWildcard(const Node* n) const {
@@ -307,7 +280,7 @@ void AliasDb::analyze(Block* block) {
 
 // The basic strategy is:
 //   1. Retrieve alias information for every input.
-//   2. Use the node's schema's alias annotations to propgagate alias/write
+//   2. Use the node's schema's alias annotations to propagate alias/write
 //      information to the outputs. For unschematized nodes, a special analyzer
 //      will have to be handwritten.
 void AliasDb::analyze(Node* node) {
@@ -436,6 +409,11 @@ void AliasDb::analyze(Node* node) {
 
     addAlias(actual, outputAlias);
   }
+
+  // Keep the wildcard index up to date.
+  if (hasWildcardImpl(node)) {
+    wildcardNodes_.insert(node);
+  }
 }
 
 void AliasDb::analyzeIf(Node* node) {
@@ -497,7 +475,11 @@ void AliasDb::analyzeLoop(Node* node) {
 }
 
 void AliasDb::analyzeSubgraph(Node* node) {
-  const auto subgraphBlock = node->g(attr::Subgraph)->block();
+  const auto subgraph = node->g(attr::Subgraph).get();
+
+  subgraphToOwner_.insert({subgraph, node});
+
+  const auto subgraphBlock = subgraph->block();
   mapAliases(subgraphBlock->inputs(), node->inputs());
 
   analyze(subgraphBlock);
@@ -566,6 +548,13 @@ void AliasDb::addAlias(const Value* value, AliasInfo alias) {
   if (!shouldAnnotate(value)) {
     return;
   }
+  // We don't support composite types yet
+  JIT_ASSERT(alias.containedTypes().size() == 0);
+  // Update reverse index
+  for (const auto set : alias.sets()) {
+    aliasToValue_[set].insert(value);
+  }
+
   if (valueToAlias_.count(value) != 0) {
     valueToAlias_[value].unionWith(alias);
   } else {
@@ -586,6 +575,8 @@ void AliasDb::addAlias(const Value* value, Symbol alias) {
     aliasInfo.addSet(alias);
     valueToAlias_.insert({value, std::move(aliasInfo)});
   }
+  // Update reverse index
+  aliasToValue_[alias].insert(value);
 }
 
 // Union the alias info of `value` with `from`
@@ -913,20 +904,158 @@ void AliasDb::move(Node* toMove, Node* movePoint, MoveSide moveSide) {
   }
 }
 
+c10::optional<const Node*> AliasDb::getLastWildcard() const {
+  auto it = std::max_element(
+      wildcardNodes_.cbegin(),
+      wildcardNodes_.cend(),
+      [this](const Node* a, const Node* b) { return isBeforeSameGraph(a, b); });
+  if (it != wildcardNodes_.end()) {
+    return *it;
+  } else {
+    return c10::nullopt;
+  }
+}
+
 bool AliasDb::hasUntrackedEffects(Node* node) const {
   bool touchesWildcard = false;
-  if (!wildcardNodes_.empty()) {
-    auto lastWildcard = *wildcardNodes_.begin();
-    for (const auto wildcard : wildcardNodes_) {
-      if (wildcard->isAfter(lastWildcard)) {
-        lastWildcard = wildcard;
-      }
-    }
+  if (const auto lastWildcard = getLastWildcard()) {
     touchesWildcard = hasWrites(node) &&
-        (node->isBefore(lastWildcard) || node == lastWildcard);
+        (isBeforeSameGraph(node, *lastWildcard) || node == *lastWildcard);
   }
 
   return writesToInputAlias(node) || touchesWildcard;
 }
+
+bool AliasDb::canDeinplace(Node* node) const {
+  auto name = std::string(node->kind().toQualString());
+  if (!hasWrites(node) || name.at(name.size() - 1) != '_') {
+    // Not an in-place op.
+    return false;
+  }
+
+  // Check if the node is safe to be de-inplaced:
+  // 1. No wildcard node after `node`.
+  const auto lastWildcard = getLastWildcard();
+  if (lastWildcard && (*lastWildcard)->isAfter(node)) {
+    return false;
+  }
+  // 2. No aliases of the output used after `node`.
+  Value* output = node->output();
+  for (const Value* v : getAliases(output)) {
+    if (v == output) {
+      continue;
+    }
+    for (const Use& u : v->uses()) {
+      if (u.user->isAfter(node)) {
+        return false;
+      }
+    }
+  }
+
+  return true;
+}
+
+Node* AliasDb::deinplace(Node* node) {
+  JIT_ASSERT(canDeinplace(node));
+
+  // Replace the in-place node with the out-of-place equivalent.
+  auto name = std::string(node->kind().toQualString());
+  WithInsertPoint insert_guard{node};
+  name.pop_back(); // Remove the underscore
+  Graph* graph = node->owningGraph();
+  Node* deinplaced = graph->insertNode(
+      graph->create(Symbol::fromQualString(name), node->inputs()));
+  Value* deinplacedOutput = deinplaced->output();
+  node->output()->replaceAllUsesWith(deinplacedOutput);
+
+  // Remove from the alias db.
+  erase(node);
+  node->destroy();
+
+  // Add the new node to the alias db.
+  insert(deinplaced);
+  return deinplaced;
+}
+
+void AliasDb::erase(Node* n) {
+  // We should only erase unused nodes
+  for (const auto output : n->outputs()) {
+    JIT_ASSERT(output->uses().size() == 0);
+  }
+
+  // Only support schematized nodes for now. If/loop will require special
+  // handling for inner blocks
+  JIT_ASSERT(n->maybeSchema());
+
+  std::unordered_set<const Value*> allValues;
+  for (const auto v : n->inputs()) {
+    allValues.insert(v);
+  }
+  for (const auto v : n->outputs()) {
+    allValues.insert(v);
+  }
+
+  // Get the union of all the alias sets that `n` uses
+  AliasInfo allSets;
+  for (const auto v : allValues) {
+    if (valueToAlias_.count(v)) {
+      allSets.unionWith(valueToAlias_.at(v));
+      valueToAlias_.erase(v);
+    }
+  }
+
+  for (const auto set : allSets.sets()) {
+    auto& values = aliasToValue_.at(set);
+    for (auto it = values.begin(); it != values.end();) {
+      if (allValues.count(*it)) {
+        it = values.erase(it);
+      } else {
+        ++it;
+      }
+    }
+
+    if (aliasToWrites_.count(set)) {
+      aliasToWrites_.at(set).erase(n);
+    }
+  }
+
+  if (wildcardNodes_.count(n)) {
+    wildcardNodes_.erase(n);
+  }
+
+  if (n->hasAttribute(attr::Subgraph)) {
+    const auto subgraph = n->g(attr::Subgraph).get();
+    subgraphToOwner_.erase(subgraph);
+  }
+}
+
+void AliasDb::insert(Node* n) {
+  analyze(n);
+}
+
+// Nodes must be in the same graph in order to do `isBefore` or `isAfter`. This
+// traverses the subgraph "chain" upward until we find two nodes that share an
+// owning graph.
+bool AliasDb::isBeforeSameGraph(const Node* a, const Node* b) const {
+  auto lhs = a;
+  while (true) {
+    auto rhs = b;
+    while (true) {
+      if (lhs->owningGraph() == rhs->owningGraph()) {
+        return lhs->isBefore(rhs);
+      }
+      if (!subgraphToOwner_.count(rhs->owningGraph())) {
+        break;
+      }
+      rhs = subgraphToOwner_.at(rhs->owningGraph());
+    }
+    if (!subgraphToOwner_.count(lhs->owningGraph())) {
+      break;
+    }
+    lhs = subgraphToOwner_.at(lhs->owningGraph());
+  }
+  JIT_ASSERT(false);
+}
+
 } // namespace jit
 } // namespace torch

@@ -2064,6 +2064,49 @@ void testAliasAnalysis() {
     JIT_ASSERT(!aliasDb.moveAfterTopologicallyValid(
         usesB->node(), mutatesAliasOfB->node()));
   }
+  {
+    // test de-inplacing
+    auto graph = std::make_shared<Graph>();
+    auto a = graph->addInput();
+    auto b = graph->addInput();
+
+    // a += b
+    // d = a + a
+    auto aMut = graph->insert(aten::add_, {a, b});
+    auto d = graph->insert(aten::add, {aMut, aMut});
+    graph->registerOutput(d);
+
+    graph->lint();
+
+    auto aInput = at::ones({5}, at::kCPU);
+    auto bInput = at::zeros({5}, at::kCPU);
+
+    auto v = [](at::Tensor t) { return autograd::make_variable(t, false); };
+    // Run the original graph
+    GraphExecutor executor(graph);
+    auto stack = createStack({v(aInput), v(bInput)});
+    executor.run(stack);
+    ASSERT_EQ(stack.size(), 1);
+    auto inplaceResult = stack[0].toTensor();
+
+    // De-inplace the add_ op
+    auto aliasDb = AliasAnalysis(graph);
+    JIT_ASSERT(aliasDb.canDeinplace(aMut->node()));
+    auto deinplaced = aliasDb.deinplace(aMut->node());
+    JIT_ASSERT(deinplaced->kind() == aten::add);
+
+    graph->lint();
+
+    // Run the new graph
+    executor = GraphExecutor(graph);
+    stack = createStack({v(aInput), v(bInput)});
+    executor.run(stack);
+    ASSERT_EQ(stack.size(), 1);
+    auto deinplacedResult = stack[0].toTensor();
+
+    // They should be equal.
+    JIT_ASSERT(almostEqual(inplaceResult, deinplacedResult));
+  }
 }
 } // namespace
 } // namespace jit

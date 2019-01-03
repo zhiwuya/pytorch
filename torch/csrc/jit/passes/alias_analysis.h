@@ -71,6 +71,15 @@ class AliasDb {
   bool couldMoveAfterTopologically(Node* n, Node* movePoint);
   bool couldMoveBeforeTopologically(Node* n, Node* movePoint);
 
+  // Returns true if `n` is safe to be deinplaced.
+  bool canDeinplace(Node* n) const;
+
+  // De-inplace this node, turning it into a pure operator (e.g. add_ -> add)
+  // and rewriting subsequent uses of `n`'s output to use the result.
+  //
+  // Returns the new deinplaced node.
+  Node* deinplace(Node* n);
+
   // For debugging: print alias db state to stdout
   void dump() const;
 
@@ -82,8 +91,16 @@ class AliasDb {
   void move(Node* movePoint, Node* toMove, MoveSide moveSide);
   bool isBeforeOrAfter(const Node* n, MoveSide moveSide) const;
 
+  // Insert `n` and its values into the db
+  void insert(Node* n);
+
+  // Erase `n` and its values from the db
+  void erase(Node* n);
+
   // Does `n` use or write to any wildcard aliases?
   bool hasWildcard(const Node* n) const;
+  // Returns nullopt if there are no wildcard nodes
+  c10::optional<const Node*> getLastWildcard() const;
 
   // Does `n` write to a value that may alias one of the graph inputs?
   bool writesToInputAlias(Node* n) const;
@@ -109,9 +126,10 @@ class AliasDb {
   void giveFreshAlias(const Value* value);
 
   bool hasUsesAfter(Symbol alias, const Node* n) const;
-  void buildWildcardIndex(const Block* b);
   bool hasWildcardImpl(const Node* n) const;
   bool writesTo(Node* n, const Value* v) const;
+
+  bool isBeforeSameGraph(const Node* lhs, const Node* rhs) const;
 
   std::shared_ptr<Graph> graph_;
   Symbol latestSymbol_ = Symbol::fromQualString("alias::0");
@@ -120,6 +138,7 @@ class AliasDb {
   std::unordered_map<Symbol, std::unordered_set<Node*>> aliasToWrites_;
   std::unordered_set<const Node*> wildcardNodes_;
   std::unordered_set<Symbol> graphInputAliases_;
+  std::unordered_map<const Graph*, const Node*> subgraphToOwner_;
 };
 
 inline TORCH_API AliasDb AliasAnalysis(std::shared_ptr<Graph> graph) {

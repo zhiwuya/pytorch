@@ -280,6 +280,13 @@ void Node::lint() const {
     }
   }
 
+  // Nodes must produce new values as output.
+  for (auto input : inputs_) {
+    for (auto output : outputs_) {
+      JIT_ASSERT(input != output);
+    }
+  }
+
   // Node subclass invariants
   IR_IF(this, Constant)
   JIT_ASSERT(inputs_.size() == 0);
