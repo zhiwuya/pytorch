@@ -9612,6 +9612,15 @@ tensor([[[1., 1., 1.,  ..., 1., 1., 1.],
         do_test(torch.tensor([[1, 2]]).data)
         do_test(torch.tensor([[1, 2]]).detach())
 
+    def test_c10_layer_norm(self):
+        # test that we can call c10 ops and they return a reasonable result
+        X = torch.rand(5, 5)
+        epsilon = 1e-4
+
+        expected_norm = torch.nn.functional.layer_norm(X, X.size()[1:], eps=epsilon)
+        actual_norm, actual_mean, actual_stdev = torch.ops.caffe2.layer_norm_dont_use_this_op_yet(torch.tensor(X), 0, epsilon)
+        self.assertTrue(np.allclose(expected_norm.numpy(), actual_norm.numpy()))
+
 # Functions to test negative dimension wrapping
 METHOD = 1
 INPLACE_METHOD = 2
